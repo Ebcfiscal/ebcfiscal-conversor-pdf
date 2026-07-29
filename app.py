@@ -46,9 +46,10 @@ BANKS = [
 COLUMNS = ["Fecha", "Concepto / Descripción", "Depósito", "Retiro", "Saldo"]
 EMAIL_RE = re.compile(r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)+$", re.I)
 
-DATE_TOKEN = r"(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{1,2}\s+(?:ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|OCT|NOV|DIC)[A-Z]*\.?(?:\s+\d{2,4})?)"
-MONEY_TOKEN = r"(?:\(\s*)?(?:\$\s*)?-?\s*\d[\d,]*(?:\.\d{2})(?:\s*\))?"
+DATE_TOKEN = r"(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{1,2}(?:\s+|[/-])(?:ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|SEPT|OCT|NOV|DIC)[A-Z]*\.?(?:(?:\s+|[/-])\d{2,4})?)"
+MONEY_TOKEN = r"(?:\(\s*)?(?:\$\s*)?-?\s*\d[\d,]*(?:\.\d{2})(?:\s*\))?-?"
 DATE_RE = re.compile(rf"^\s*(?P<date>{DATE_TOKEN})\b", re.I)
+DATE_ANY_RE = re.compile(rf"(?P<date>{DATE_TOKEN})\b", re.I)
 MONEY_RE = re.compile(rf"(?<!\w)({MONEY_TOKEN})(?!\w)", re.I)
 
 MONTHS = {
@@ -188,8 +189,10 @@ def money_to_float(value: object) -> float:
     if value is None or clean_text(value) in {"", "-", "—"}:
         return 0.0
     raw = clean_text(value)
-    negative = raw.startswith("(") and raw.endswith(")")
+    negative = (raw.startswith("(") and raw.endswith(")")) or raw.rstrip().endswith("-")
     raw = re.sub(r"[^\d.\-]", "", raw.replace(",", ""))
+    if raw.endswith("-"):
+        raw = raw[:-1]
     try:
         amount = float(raw)
     except ValueError:
@@ -217,6 +220,8 @@ def normalize_date(value: str, default_year: int) -> str:
         year = int(numeric.group(3)) if numeric.group(3) else default_year
         year += 2000 if year < 100 else 0
         return datetime(year, month, day).strftime("%d/%m/%Y")
+    text = re.sub(r"[/-]", " ", text)
+    text = clean_text(text)
     named = re.fullmatch(r"(\d{1,2})\s+([A-Z]+)(?:\s+(\d{2,4}))?", text)
     if not named or named.group(2) not in MONTHS:
         raise ValueError(f"Fecha no reconocida: {value}")
@@ -225,8 +230,8 @@ def normalize_date(value: str, default_year: int) -> str:
     return datetime(year, MONTHS[named.group(2)], int(named.group(1))).strftime("%d/%m/%Y")
 
 
-def words_to_lines(words: Sequence[dict], tolerance: float = 3.0) -> list[str]:
-    """Reconstruye lineas por coordenadas (top/x0) conservando columnas visuales."""
+def group_words_by_line(words: Sequence[dict], tolerance: float = 3.0) -> list[list[dict]]:
+    """Agrupa palabras por su coordenada vertical."""
     if not words:
         return []
     rows: list[list[dict]] = []
@@ -235,7 +240,132 @@ def words_to_lines(words: Sequence[dict], tolerance: float = 3.0) -> list[str]:
             rows.append([word])
         else:
             rows[-1].append(word)
-    return [clean_text(" ".join(w["text"] for w in sorted(row, key=lambda item: float(item["x0"])))) for row in rows]
+    return [sorted(row, key=lambda item: float(item["x0"])) for row in rows]
+
+
+def words_to_lines(words: Sequence[dict], tolerance: float = 3.0) -> list[str]:
+    """Reconstruye líneas por coordenadas para el respaldo de texto corrido."""
+    return [clean_text(" ".join(w["text"] for w in row)) for row in group_words_by_line(words, tolerance)]
+
+
+def word_center(word: dict) -> float:
+    return (float(word["x0"]) + float(word.get("x1", word["x0"]))) / 2
+
+
+def coordinate_header_anchors(rows: Sequence[Sequence[dict]], start: int) -> tuple[dict[str, float], int] | None:
+    """Localiza encabezados aunque estén repartidos en dos líneas visuales."""
+    for span in (1, 2):
+        if start + span > len(rows):
+            continue
+        candidate = [word for row in rows[start:start + span] for word in row]
+        positions: dict[str, list[float]] = {}
+        for word in candidate:
+            role = header_role(str(word.get("text", "")))
+            if role:
+                positions.setdefault(role, []).append(word_center(word))
+        if "date" not in positions:
+            continue
+        has_direction = "deposit" in positions or "withdrawal" in positions
+        if not has_direction and "amount" not in positions:
+            continue
+        if not ("balance" in positions or {"deposit", "withdrawal"}.issubset(positions)):
+            continue
+        anchors: dict[str, float] = {}
+        for role, values in positions.items():
+            if role == "date":
+                anchors[role] = min(values)
+            elif role == "amount" and len(values) > 1:
+                # Un encabezado genérico repetido no permite distinguir columnas.
+                continue
+            else:
+                anchors[role] = sum(values) / len(values)
+        if "description" not in anchors:
+            monetary_x = [anchors[role] for role in ("deposit", "withdrawal", "amount", "balance") if role in anchors]
+            if monetary_x:
+                anchors["description"] = (anchors["date"] + min(monetary_x)) / 2
+        return anchors, start + span
+    return None
+
+
+def coordinate_table_rows(words: Sequence[dict]) -> list[list[str]]:
+    """Crea una tabla a partir de posiciones x/y cuando el PDF no contiene celdas."""
+    visual_rows = group_words_by_line(words)
+    result: list[list[str]] = []
+    index = 0
+    anchors: dict[str, float] | None = None
+    data_start = 0
+
+    while index < len(visual_rows):
+        located = coordinate_header_anchors(visual_rows, index)
+        if located:
+            anchors, data_start = located
+            result.append(["FECHA", "DESCRIPCION", "DEPOSITOS", "RETIROS", "SALDO", "IMPORTE"])
+            index = data_start
+            break
+        index += 1
+    if not anchors:
+        return []
+
+    monetary_roles = [role for role in ("deposit", "withdrawal", "balance", "amount") if role in anchors]
+    first_monetary_x = min(anchors[role] for role in monetary_roles)
+    description_limit = (anchors["description"] + first_monetary_x) / 2
+
+    for visual_row in visual_rows[data_start:]:
+        repeated = coordinate_header_anchors([visual_row], 0)
+        if repeated:
+            new_anchors, _ = repeated
+            anchors.update(new_anchors)
+            monetary_roles = [role for role in ("deposit", "withdrawal", "balance", "amount") if role in anchors]
+            first_monetary_x = min(anchors[role] for role in monetary_roles)
+            description_limit = (anchors["description"] + first_monetary_x) / 2
+            continue
+
+        line = clean_text(" ".join(str(word.get("text", "")) for word in visual_row))
+        date_match = DATE_ANY_RE.search(line)
+        if date_match and date_match.start() > 24:
+            date_match = None
+
+        role_values: dict[str, list[str]] = {role: [] for role in monetary_roles}
+        monetary_word_ids: set[int] = set()
+        for word_index, word in enumerate(visual_row):
+            text = clean_text(word.get("text", ""))
+            if not MONEY_RE.fullmatch(text):
+                continue
+            x = word_center(word)
+            if x < description_limit:
+                continue
+            nearest_role = min(monetary_roles, key=lambda role: abs(x - anchors[role]))
+            role_values[nearest_role].append(text)
+            monetary_word_ids.add(word_index)
+
+        if date_match:
+            date_text = date_match.group("date")
+            date_parts = clean_text(line[:date_match.end()]).split()
+            date_word_count = len(date_parts)
+            description_words = [
+                clean_text(word.get("text", ""))
+                for word_index, word in enumerate(visual_row)
+                if word_index >= date_word_count and word_index not in monetary_word_ids
+            ]
+            description = clean_text(" ".join(description_words))
+            if any(role_values.values()):
+                result.append([
+                    date_text,
+                    description,
+                    clean_text(" ".join(role_values.get("deposit", []))),
+                    clean_text(" ".join(role_values.get("withdrawal", []))),
+                    clean_text(" ".join(role_values.get("balance", []))),
+                    clean_text(" ".join(role_values.get("amount", []))),
+                ])
+        elif result and not any(role_values.values()):
+            continuation = clean_text(" ".join(
+                clean_text(word.get("text", ""))
+                for word in visual_row
+                if word_center(word) < first_monetary_x
+            ))
+            if continuation:
+                result.append(["", continuation, "", "", "", ""])
+    return result
 
 
 def extract_pdf_rows(pdf_bytes: bytes) -> tuple[list[str], list[list[str]]]:
@@ -246,6 +376,12 @@ def extract_pdf_rows(pdf_bytes: bytes) -> tuple[list[str], list[list[str]]]:
         for page in pdf.pages:
             page_words = page.extract_words(x_tolerance=2, y_tolerance=3, keep_blank_chars=False)
             lines.extend(words_to_lines(page_words))
+            # Muchos bancos dibujan columnas visuales sin bordes de tabla.
+            # Esta ruta conserva cargos/abonos usando las coordenadas x/y.
+            coordinate_rows = coordinate_table_rows(page_words)
+            if coordinate_rows:
+                table_rows.extend(coordinate_rows)
+                continue
             settings_candidates = (
                 {"vertical_strategy": "lines", "horizontal_strategy": "lines", "snap_tolerance": 3},
                 {"vertical_strategy": "text", "horizontal_strategy": "text", "intersection_tolerance": 5},
@@ -282,11 +418,17 @@ def header_role(value: str) -> str | None:
     text = comparable(value)
     if not text:
         return None
+    deposit_terms = ("deposito", "depositos", "abono", "abonos", "credito")
+    withdrawal_terms = ("retiro", "retiros", "cargo", "cargos", "debito")
+    has_deposit_term = any(word in text for word in deposit_terms)
+    has_withdrawal_term = any(word in text for word in withdrawal_terms)
     if "fecha" in text or text in {"dia", "f operacion", "f. operacion"}:
         return "date"
-    if any(word in text for word in ("deposito", "depositos", "abono", "abonos", "credito")):
+    if has_deposit_term and has_withdrawal_term:
+        return "amount"
+    if has_deposit_term:
         return "deposit"
-    if any(word in text for word in ("retiro", "retiros", "cargo", "cargos", "debito")):
+    if has_withdrawal_term:
         return "withdrawal"
     if "saldo" in text:
         return "balance"
@@ -920,10 +1062,21 @@ def render_app() -> None:
                     lines, tables = extract_pdf_rows(pdf_bytes)
                     frame = PARSERS[bank](lines, tables)
                 if frame.empty:
-                    st.warning(
-                        "No se detectaron movimientos. El PDF puede ser una imagen escaneada, "
-                        "estar protegido o usar un formato distinto al esperado."
-                    )
+                    if lines:
+                        st.warning(
+                            "El PDF sí contiene texto, pero no se encontraron movimientos monetarios "
+                            "que puedan validarse con seguridad. Puede usar una estructura bancaria "
+                            "distinta; no se generó un Excel para evitar datos incorrectos."
+                        )
+                        st.caption(
+                            f"Diagnóstico: {len(lines):,} líneas de texto y "
+                            f"{len(tables):,} filas tabulares analizadas."
+                        )
+                    else:
+                        st.warning(
+                            "No se encontró texto seleccionable. El PDF puede estar escaneado, "
+                            "protegido o dañado."
+                        )
                     st.session_state.pop("conversion", None)
                 else:
                     st.session_state["conversion"] = {
