@@ -211,9 +211,29 @@ def infer_statement_year(lines: Sequence[str]) -> int:
     return max(set(years), key=years.count) if years else datetime.now().year
 
 
-def normalize_date(value: str, default_year: int) -> str:
+def infer_statement_month(lines: Sequence[str]) -> int | None:
+    """Obtiene el mes del período/corte para bancos que imprimen sólo el día."""
+    prioritized = [line for line in lines if any(token in comparable(line) for token in ("periodo", "corte"))]
+    candidates = prioritized + list(lines[:100])
+    month_names = "|".join(sorted(MONTHS, key=len, reverse=True))
+    for line in candidates:
+        normalized = comparable(line).upper()
+        named = re.search(rf"\b({month_names})\b", normalized)
+        if named:
+            return MONTHS[named.group(1)]
+        numeric = re.search(r"\b\d{1,2}[/-](\d{1,2})[/-]20\d{2}\b", normalized)
+        if numeric and 1 <= int(numeric.group(1)) <= 12:
+            return int(numeric.group(1))
+    return None
+
+
+def normalize_date(value: str, default_year: int, default_month: int | None = None) -> str:
     """Devuelve una fecha bancaria en formato DD/MM/YYYY."""
     text = comparable(value).upper().replace(".", "")
+    if re.fullmatch(r"\d{1,2}", text):
+        if default_month is None:
+            raise ValueError(f"Falta el mes para la fecha: {value}")
+        return datetime(default_year, default_month, int(text)).strftime("%d/%m/%Y")
     numeric = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", text)
     if numeric:
         day, month = int(numeric.group(1)), int(numeric.group(2))
@@ -309,6 +329,9 @@ def coordinate_table_rows(words: Sequence[dict]) -> list[list[str]]:
     monetary_roles = [role for role in ("deposit", "withdrawal", "balance", "amount") if role in anchors]
     first_monetary_x = min(anchors[role] for role in monetary_roles)
     description_limit = (anchors["description"] + first_monetary_x) / 2
+    monetary_positions = sorted(anchors[role] for role in monetary_roles)
+    gaps = [right - left for left, right in zip(monetary_positions, monetary_positions[1:]) if right > left]
+    max_anchor_distance = max(38.0, min(80.0, (min(gaps) * 0.68) if gaps else 65.0))
 
     for visual_row in visual_rows[data_start:]:
         repeated = coordinate_header_anchors([visual_row], 0)
@@ -318,12 +341,22 @@ def coordinate_table_rows(words: Sequence[dict]) -> list[list[str]]:
             monetary_roles = [role for role in ("deposit", "withdrawal", "balance", "amount") if role in anchors]
             first_monetary_x = min(anchors[role] for role in monetary_roles)
             description_limit = (anchors["description"] + first_monetary_x) / 2
+            monetary_positions = sorted(anchors[role] for role in monetary_roles)
+            gaps = [right - left for left, right in zip(monetary_positions, monetary_positions[1:]) if right > left]
+            max_anchor_distance = max(38.0, min(80.0, (min(gaps) * 0.68) if gaps else 65.0))
             continue
 
         line = clean_text(" ".join(str(word.get("text", "")) for word in visual_row))
         date_match = DATE_ANY_RE.search(line)
         if date_match and date_match.start() > 24:
             date_match = None
+        day_only_index: int | None = None
+        if not date_match:
+            for candidate_index, word in enumerate(visual_row):
+                candidate_text = clean_text(word.get("text", ""))
+                if re.fullmatch(r"\d{1,2}", candidate_text) and abs(word_center(word) - anchors["date"]) <= 55:
+                    day_only_index = candidate_index
+                    break
 
         role_values: dict[str, list[str]] = {role: [] for role in monetary_roles}
         monetary_word_ids: set[int] = set()
@@ -335,13 +368,28 @@ def coordinate_table_rows(words: Sequence[dict]) -> list[list[str]]:
             if x < description_limit:
                 continue
             nearest_role = min(monetary_roles, key=lambda role: abs(x - anchors[role]))
+            anchor_distance = abs(x - anchors[nearest_role])
+            if anchor_distance > max_anchor_distance:
+                continue
+            context = " ".join(
+                comparable(clean_text(visual_row[neighbor].get("text", "")))
+                for neighbor in range(max(0, word_index - 2), min(len(visual_row), word_index + 3))
+                if neighbor != word_index
+            )
+            foreign_context = any(
+                marker in context
+                for marker in ("usd", "dls", "dlls", "dolar", "dolares", "eur", "euro", "cambio", "%")
+            )
+            # Una cifra perfectamente alineada con una columna monetaria prevalece;
+            # una cifra desplazada y rodeada de USD/tipo de cambio pertenece al concepto.
+            if foreign_context and anchor_distance > 28:
+                continue
             role_values[nearest_role].append(text)
             monetary_word_ids.add(word_index)
 
-        if date_match:
-            date_text = date_match.group("date")
-            date_parts = clean_text(line[:date_match.end()]).split()
-            date_word_count = len(date_parts)
+        if date_match or day_only_index is not None:
+            date_text = date_match.group("date") if date_match else clean_text(visual_row[day_only_index].get("text", ""))
+            date_word_count = len(clean_text(line[:date_match.end()]).split()) if date_match else day_only_index + 1
             description_words = [
                 clean_text(word.get("text", ""))
                 for word_index, word in enumerate(visual_row)
@@ -357,7 +405,16 @@ def coordinate_table_rows(words: Sequence[dict]) -> list[list[str]]:
                     clean_text(" ".join(role_values.get("balance", []))),
                     clean_text(" ".join(role_values.get("amount", []))),
                 ])
-        elif result and not any(role_values.values()):
+        elif result and any(role_values.values()):
+            # Afirme y otros bancos pueden imprimir el saldo varias líneas
+            # después del depósito/retiro del mismo movimiento.
+            target = next((item for item in reversed(result[1:]) if item[0]), None)
+            if target:
+                role_columns = {"deposit": 2, "withdrawal": 3, "balance": 4, "amount": 5}
+                for role, values in role_values.items():
+                    if values and not target[role_columns[role]]:
+                        target[role_columns[role]] = clean_text(" ".join(values))
+        elif result:
             continuation = clean_text(" ".join(
                 clean_text(word.get("text", ""))
                 for word in visual_row
@@ -476,10 +533,79 @@ def make_frame(records: Sequence[dict]) -> pd.DataFrame:
     return frame.drop_duplicates().reset_index(drop=True)
 
 
+def extract_declared_totals(lines: Sequence[str]) -> dict[str, float]:
+    """Lee totales del resumen sin confundir encabezados o movimientos."""
+    deposits: list[float] = []
+    withdrawals: list[float] = []
+    for line in lines:
+        normalized = comparable(line)
+        if "deposito" in normalized and "retiro" in normalized:
+            continue
+        amounts = [abs(money_to_float(match.group(1))) for match in MONEY_RE.finditer(line)]
+        if not amounts:
+            continue
+        if re.search(r"\b(?:total\s+de\s+|total\s+)?depositos\b", normalized):
+            deposits.append(amounts[-1])
+        elif re.search(r"\b(?:total\s+de\s+|total\s+)?retiros\b", normalized):
+            withdrawals.append(amounts[-1])
+    totals: dict[str, float] = {}
+    if deposits:
+        totals["Depósito"] = round(sum(deposits), 2)
+    if withdrawals:
+        totals["Retiro"] = round(sum(withdrawals), 2)
+    return totals
+
+
+def validate_extraction_totals(frame: pd.DataFrame, lines: Sequence[str]) -> list[str]:
+    """Advierte si el detalle no concilia con los totales impresos por el banco."""
+    declared = extract_declared_totals(lines)
+    warnings: list[str] = []
+    labels = {"Depósito": "depósitos", "Retiro": "retiros"}
+    for column, expected in declared.items():
+        extracted = round(float(frame[column].sum()), 2)
+        tolerance = max(0.02, abs(expected) * 0.000001)
+        if abs(extracted - expected) > tolerance:
+            warnings.append(
+                f"Los {labels[column]} extraídos suman ${extracted:,.2f}, "
+                f"pero el resumen del PDF indica ${expected:,.2f}."
+            )
+
+    # Comprueba que cada saldo se explique por el movimiento correspondiente.
+    balances = pd.to_numeric(frame["Saldo"], errors="coerce")
+    dates = pd.to_datetime(frame["Fecha"], format="%d/%m/%Y", errors="coerce")
+    failures: list[int] = []
+    descending = len(dates) > 1 and dates.iloc[-1] < dates.iloc[0]
+    for index in range(1, len(frame)):
+        if pd.isna(balances.iloc[index - 1]) or pd.isna(balances.iloc[index]):
+            continue
+        if descending:
+            expected_balance = (
+                balances.iloc[index - 1]
+                - float(frame["Depósito"].iloc[index - 1])
+                + float(frame["Retiro"].iloc[index - 1])
+            )
+        else:
+            expected_balance = (
+                balances.iloc[index - 1]
+                + float(frame["Depósito"].iloc[index])
+                - float(frame["Retiro"].iloc[index])
+            )
+        if abs(float(balances.iloc[index]) - expected_balance) > 0.03:
+            failures.append(index)
+    if failures:
+        first = failures[0]
+        warnings.append(
+            f"El saldo no concilia en {len(failures)} movimiento(s); "
+            f"la primera diferencia aparece el {frame['Fecha'].iloc[first]}."
+        )
+    return warnings
+
+
 def parse_structured_tables(
     rows: Sequence[Sequence[str]],
     config: BankConfig,
     default_year: int,
+    default_month: int | None,
 ) -> pd.DataFrame:
     """Interpreta tablas conservando las celdas vacías de cargos y abonos."""
     records: list[dict] = []
@@ -505,6 +631,7 @@ def parse_structured_tables(
 
         date_cell = joined("date")
         date_match = DATE_RE.match(date_cell)
+        day_only = re.fullmatch(r"\d{1,2}", date_cell)
         monetary_indexes = {
             index
             for role in ("deposit", "withdrawal", "balance", "amount")
@@ -516,12 +643,13 @@ def parse_structured_tables(
             description_indexes = set(range(len(row))) - monetary_indexes - date_indexes
         description = clean_text(" ".join(row[index] for index in sorted(description_indexes) if index < len(row)))
 
-        if date_match:
+        if date_match or day_only:
             if current:
                 records.append(current)
                 previous_balance = current.get("Saldo")
             try:
-                date = normalize_date(date_match.group("date"), default_year)
+                date_text = date_match.group("date") if date_match else date_cell
+                date = normalize_date(date_text, default_year, default_month)
             except (ValueError, OverflowError):
                 current = None
                 continue
@@ -605,7 +733,8 @@ def parse_bank(lines: Sequence[str], table_rows: Sequence[Sequence[str]], config
     """Usa primero tablas con columnas; recurre a texto sólo de forma estricta."""
     table_lines = table_rows_to_lines(table_rows)
     year = infer_statement_year(list(lines) + table_lines)
-    structured = parse_structured_tables(table_rows, config, year)
+    month = infer_statement_month(list(lines) + table_lines)
+    structured = parse_structured_tables(table_rows, config, year, month)
     if not structured.empty:
         return structured
 
@@ -1085,6 +1214,7 @@ def render_app() -> None:
                         "email": email.strip(),
                         "auto_send": send_automatically,
                         "sent": False,
+                        "validation_warnings": validate_extraction_totals(frame, lines),
                     }
                     st.success(f"Se detectaron {len(frame):,} movimientos.")
             except Exception as exc:
@@ -1104,6 +1234,8 @@ def render_app() -> None:
         '<div class="section-copy">Corrige cualquier dato de las primeras 10 filas antes de generar el archivo.</div>',
         unsafe_allow_html=True,
     )
+    for warning in conversion.get("validation_warnings", []):
+        st.warning(f"Revisión necesaria: {warning}")
     metric_a, metric_b, metric_c = st.columns(3, gap="medium")
     with metric_a:
         st.metric("Movimientos", f"{len(conversion['frame']):,}")
