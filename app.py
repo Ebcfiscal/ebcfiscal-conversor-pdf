@@ -47,7 +47,7 @@ COLUMNS = ["Fecha", "Concepto / Descripción", "Depósito", "Retiro", "Saldo"]
 EMAIL_RE = re.compile(r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)+$", re.I)
 
 DATE_TOKEN = r"(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{1,2}\s+(?:ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|OCT|NOV|DIC)[A-Z]*\.?(?:\s+\d{2,4})?)"
-MONEY_TOKEN = r"(?:\$\s*)?-?\s*\d[\d,]*(?:\.\d{2})"
+MONEY_TOKEN = r"(?:\(\s*)?(?:\$\s*)?-?\s*\d[\d,]*(?:\.\d{2})(?:\s*\))?"
 DATE_RE = re.compile(rf"^\s*(?P<date>{DATE_TOKEN})\b", re.I)
 MONEY_RE = re.compile(rf"(?<!\w)({MONEY_TOKEN})(?!\w)", re.I)
 
@@ -253,11 +253,10 @@ def extract_pdf_rows(pdf_bytes: bytes) -> tuple[list[str], list[list[str]]]:
             page_tables: list[list[list[str | None]]] = []
             for settings in settings_candidates:
                 try:
-                    page_tables = page.extract_tables(table_settings=settings) or []
+                    detected = page.extract_tables(table_settings=settings) or []
                 except Exception:  # Algunos PDFs tienen trazos malformados.
-                    page_tables = []
-                if page_tables:
-                    break
+                    detected = []
+                page_tables.extend(detected)
             for table in page_tables:
                 for row in table:
                     cleaned = [clean_text(cell) for cell in (row or [])]
@@ -278,48 +277,206 @@ def table_rows_to_lines(rows: Sequence[Sequence[str]]) -> list[str]:
     return [clean_text(" ".join(cell for cell in row if clean_text(cell))) for row in rows]
 
 
+def header_role(value: str) -> str | None:
+    """Clasifica el encabezado de una columna bancaria sin depender de acentos."""
+    text = comparable(value)
+    if not text:
+        return None
+    if "fecha" in text or text in {"dia", "f operacion", "f. operacion"}:
+        return "date"
+    if any(word in text for word in ("deposito", "depositos", "abono", "abonos", "credito")):
+        return "deposit"
+    if any(word in text for word in ("retiro", "retiros", "cargo", "cargos", "debito")):
+        return "withdrawal"
+    if "saldo" in text:
+        return "balance"
+    if any(word in text for word in ("importe", "monto")):
+        return "amount"
+    if any(word in text for word in ("concepto", "descripcion", "detalle", "movimiento", "operacion", "referencia")):
+        return "description"
+    return None
+
+
+def locate_table_header(row: Sequence[str]) -> dict[str, list[int]] | None:
+    """Devuelve las posiciones de columnas sólo si la fila parece un encabezado real."""
+    mapping: dict[str, list[int]] = {}
+    for index, cell in enumerate(row):
+        role = header_role(clean_text(cell))
+        if role:
+            mapping.setdefault(role, []).append(index)
+    monetary_roles = {"deposit", "withdrawal", "balance", "amount"}.intersection(mapping)
+    if "date" not in mapping or not monetary_roles:
+        return None
+    if not ({"deposit", "withdrawal"}.intersection(mapping) or "amount" in mapping):
+        return None
+    return mapping
+
+
+def cell_amount(value: object) -> float | None:
+    """Lee un importe sólo cuando la celda contiene un valor monetario explícito."""
+    matches = list(MONEY_RE.finditer(clean_text(value)))
+    if not matches:
+        return None
+    return money_to_float(matches[-1].group(1))
+
+
+def make_frame(records: Sequence[dict]) -> pd.DataFrame:
+    """Valida los movimientos y elimina filas sin una operación monetaria comprobable."""
+    frame = pd.DataFrame(records, columns=COLUMNS)
+    if frame.empty:
+        return frame
+    frame["Concepto / Descripción"] = frame["Concepto / Descripción"].map(clean_text)
+    for column in ("Depósito", "Retiro"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0).abs().round(2)
+    frame["Saldo"] = pd.to_numeric(frame["Saldo"], errors="coerce").round(2)
+    has_movement = frame["Depósito"].gt(0) | frame["Retiro"].gt(0)
+    frame = frame[has_movement & frame["Concepto / Descripción"].ne("")]
+    return frame.drop_duplicates().reset_index(drop=True)
+
+
+def parse_structured_tables(
+    rows: Sequence[Sequence[str]],
+    config: BankConfig,
+    default_year: int,
+) -> pd.DataFrame:
+    """Interpreta tablas conservando las celdas vacías de cargos y abonos."""
+    records: list[dict] = []
+    columns: dict[str, list[int]] | None = None
+    current: dict | None = None
+    previous_balance: float | None = None
+
+    for raw_row in rows:
+        row = [clean_text(cell) for cell in raw_row]
+        detected_header = locate_table_header(row)
+        if detected_header:
+            if current:
+                records.append(current)
+                previous_balance = current.get("Saldo")
+                current = None
+            columns = detected_header
+            continue
+        if not columns:
+            continue
+
+        def joined(role: str) -> str:
+            return clean_text(" ".join(row[index] for index in columns.get(role, []) if index < len(row)))
+
+        date_cell = joined("date")
+        date_match = DATE_RE.match(date_cell)
+        monetary_indexes = {
+            index
+            for role in ("deposit", "withdrawal", "balance", "amount")
+            for index in columns.get(role, [])
+        }
+        date_indexes = set(columns.get("date", []))
+        description_indexes = set(columns.get("description", []))
+        if not description_indexes:
+            description_indexes = set(range(len(row))) - monetary_indexes - date_indexes
+        description = clean_text(" ".join(row[index] for index in sorted(description_indexes) if index < len(row)))
+
+        if date_match:
+            if current:
+                records.append(current)
+                previous_balance = current.get("Saldo")
+            try:
+                date = normalize_date(date_match.group("date"), default_year)
+            except (ValueError, OverflowError):
+                current = None
+                continue
+
+            deposit_raw = cell_amount(joined("deposit"))
+            withdrawal_raw = cell_amount(joined("withdrawal"))
+            balance = cell_amount(joined("balance"))
+            generic_amount = cell_amount(joined("amount"))
+            deposit = abs(deposit_raw) if deposit_raw is not None else 0.0
+            withdrawal = abs(withdrawal_raw) if withdrawal_raw is not None else 0.0
+
+            if generic_amount is not None and not deposit and not withdrawal:
+                normalized = comparable(description)
+                is_deposit = any(comparable(word) in normalized for word in config.deposit_words)
+                is_withdrawal = any(comparable(word) in normalized for word in config.withdrawal_words)
+                if generic_amount < 0 or (is_withdrawal and not is_deposit):
+                    withdrawal = abs(generic_amount)
+                elif is_deposit and not is_withdrawal:
+                    deposit = abs(generic_amount)
+                elif balance is not None and previous_balance is not None:
+                    difference = round(balance - previous_balance, 2)
+                    if abs(abs(difference) - abs(generic_amount)) <= 0.02:
+                        if difference > 0:
+                            deposit = abs(generic_amount)
+                        elif difference < 0:
+                            withdrawal = abs(generic_amount)
+
+            current = {
+                "Fecha": date,
+                "Concepto / Descripción": description,
+                "Depósito": round(deposit, 2),
+                "Retiro": round(withdrawal, 2),
+                "Saldo": balance,
+            }
+        elif current and description and not any(cell_amount(row[index]) is not None for index in monetary_indexes if index < len(row)):
+            # Una continuación es válida sólo dentro de la misma tabla y sin importes.
+            if not is_noise(description, config):
+                current["Concepto / Descripción"] = clean_text(
+                    f"{current['Concepto / Descripción']} {description}"
+                )
+
+    if current:
+        records.append(current)
+    return make_frame(records)
+
+
 def classify_amounts(description: str, amounts: list[float], config: BankConfig) -> tuple[float, float, float | None]:
     """Mapea importes a deposito/retiro/saldo usando columnas y pistas semanticas."""
     if not amounts:
         return 0.0, 0.0, None
-    values: dict[str, float] = {}
-    for label, amount in zip(reversed(config.amount_order), reversed(amounts)):
-        values[label] = abs(amount)
-    deposit = values.get("Depósito", 0.0)
-    withdrawal = values.get("Retiro", 0.0)
-    balance = values.get("Saldo")
-
     normalized = comparable(description)
     is_deposit = any(comparable(word) in normalized for word in config.deposit_words)
     is_withdrawal = any(comparable(word) in normalized for word in config.withdrawal_words)
+    deposit, withdrawal, balance = 0.0, 0.0, None
 
-    # Cuando solo existe un importe, las palabras del concepto desempatan.
-    if len(amounts) == 1 and balance is not None:
-        if is_deposit and not is_withdrawal:
-            deposit, balance = abs(amounts[0]), None
-        elif is_withdrawal and not is_deposit:
-            withdrawal, balance = abs(amounts[0]), None
-    # Si una columna vacia desaparecio del texto, corrige el desplazamiento
-    # usando la semantica de la descripcion. El ultimo importe sigue siendo saldo.
+    if len(amounts) >= 3:
+        values: dict[str, float] = {}
+        for label, amount in zip(reversed(config.amount_order), reversed(amounts)):
+            values[label] = abs(amount)
+        deposit = values.get("Depósito", 0.0)
+        withdrawal = values.get("Retiro", 0.0)
+        balance = values.get("Saldo")
     elif len(amounts) == 2:
-        if is_withdrawal and not is_deposit and deposit and not withdrawal:
-            withdrawal, deposit = deposit, 0.0
-        elif is_deposit and not is_withdrawal and withdrawal and not deposit:
-            deposit, withdrawal = withdrawal, 0.0
+        # En texto corrido el primer valor es la operación y el último el saldo.
+        # La dirección sólo se acepta si el concepto aporta evidencia; no se adivina.
+        transaction, balance = abs(amounts[0]), amounts[1]
+        if amounts[0] < 0 or (is_withdrawal and not is_deposit):
+            withdrawal = transaction
+        elif is_deposit and not is_withdrawal:
+            deposit = transaction
+    elif len(amounts) == 1:
+        transaction = abs(amounts[0])
+        if amounts[0] < 0 or (is_withdrawal and not is_deposit):
+            withdrawal = transaction
+        elif is_deposit and not is_withdrawal:
+            deposit = transaction
     return round(deposit, 2), round(withdrawal, 2), None if balance is None else round(balance, 2)
 
 
 def parse_bank(lines: Sequence[str], table_rows: Sequence[Sequence[str]], config: BankConfig) -> pd.DataFrame:
-    """Parser base: detecta movimientos y une sus continuaciones multilinea."""
-    candidates = list(lines)
-    # Las tablas aportan una segunda ruta cuando el texto posicional no es usable.
+    """Usa primero tablas con columnas; recurre a texto sólo de forma estricta."""
     table_lines = table_rows_to_lines(table_rows)
+    year = infer_statement_year(list(lines) + table_lines)
+    structured = parse_structured_tables(table_rows, config, year)
+    if not structured.empty:
+        return structured
+
+    candidates = list(lines)
     if sum(bool(DATE_RE.match(line)) for line in table_lines) > sum(bool(DATE_RE.match(line)) for line in candidates):
         candidates = table_lines
 
-    year = infer_statement_year(list(lines) + table_lines)
     records: list[dict] = []
     current: dict | None = None
+    continuation_markers = (
+        "referencia", "ref ", "folio", "clave", "rastreo", "beneficiario",
+        "ordenante", "rfc", "spei", "concepto", "cuenta destino",
+    )
 
     for raw_line in candidates:
         line = clean_text(raw_line)
@@ -345,27 +502,17 @@ def parse_bank(lines: Sequence[str], table_rows: Sequence[Sequence[str]], config
                 "Retiro": withdrawal,
                 "Saldo": balance,
             }
-        elif current and line and not is_noise(line, config):
-            # Continuaciones sin fecha pertenecen al concepto anterior; importes sueltos
-            # se ignoran para no confundir totales o referencias numericas con dinero.
-            continuation = MONEY_RE.sub("", line)
-            continuation = clean_text(continuation)
-            if continuation and not DATE_RE.match(continuation):
+        elif current and line and not is_noise(line, config) and not MONEY_RE.search(line):
+            continuation = clean_text(line)
+            normalized_continuation = comparable(continuation)
+            if continuation and any(marker in normalized_continuation for marker in continuation_markers):
                 current["Concepto / Descripción"] = clean_text(
                     f"{current['Concepto / Descripción']} {continuation}"
                 )
     if current:
         records.append(current)
 
-    frame = pd.DataFrame(records, columns=COLUMNS)
-    if frame.empty:
-        return frame
-    frame["Concepto / Descripción"] = frame["Concepto / Descripción"].map(clean_text)
-    for column in ("Depósito", "Retiro"):
-        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0).round(2)
-    frame["Saldo"] = pd.to_numeric(frame["Saldo"], errors="coerce").round(2)
-    frame = frame[frame["Concepto / Descripción"].ne("")].drop_duplicates().reset_index(drop=True)
-    return frame
+    return make_frame(records)
 
 
 def parse_bbva(lines: Sequence[str], table_rows: Sequence[Sequence[str]]) -> pd.DataFrame:
