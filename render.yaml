@@ -4,7 +4,9 @@ services:
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
+    # Wix embeds the app from another domain. These two options allow
+    # Streamlit's file uploader to work inside that iframe without a 403.
+    startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true --server.enableXsrfProtection false --server.enableCORS false
     envVars:
       - key: SMTP_HOST
         value: smtp.gmail.com
