@@ -407,12 +407,33 @@ def coordinate_table_rows(words: Sequence[dict]) -> list[list[str]]:
 
         if date_match or day_only_index is not None:
             date_text = date_match.group("date") if date_match else clean_text(visual_row[day_only_index].get("text", ""))
-            date_word_count = len(clean_text(line[:date_match.end()]).split()) if date_match else day_only_index + 1
+            date_word_count = day_only_index + 1 if day_only_index is not None else 0
+            attached_description = ""
+            if date_match:
+                # Algunos PDF de Banorte unen fecha y concepto en una sola
+                # palabra interna: "26-ENE-26DEP.EFECTIVO". Conservamos el
+                # sufijo para que el movimiento no quede sin descripción.
+                cursor = 0
+                for word_index, word in enumerate(visual_row):
+                    word_text = clean_text(word.get("text", ""))
+                    word_start = cursor
+                    word_end = word_start + len(word_text)
+                    if word_start <= date_match.end() <= word_end:
+                        date_word_count = word_index + 1
+                        attached_description = clean_text(word_text[date_match.end() - word_start:])
+                        break
+                    cursor = word_end + 1
+                year_suffix = re.match(r"^([/-]\d{2,4})(?=\D|$)", attached_description)
+                if year_suffix and not re.search(r"[/-]\d{2,4}$", date_text):
+                    date_text = f"{date_text}{year_suffix.group(1)}"
+                    attached_description = clean_text(attached_description[year_suffix.end():])
             description_words = [
                 clean_text(word.get("text", ""))
                 for word_index, word in enumerate(visual_row)
                 if word_index >= date_word_count and word_index not in monetary_word_ids
             ]
+            if attached_description:
+                description_words.insert(0, attached_description)
             description = clean_text(" ".join(description_words))
             if any(role_values.values()):
                 result.append([
