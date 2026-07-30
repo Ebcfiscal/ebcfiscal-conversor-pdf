@@ -896,21 +896,24 @@ def dataframe_to_excel(frame: pd.DataFrame) -> bytes:
 
 def secret_value(*keys: str, default: object = None) -> object:
     """Lee claves anidadas de st.secrets sin asumir que la seccion existe."""
-    value: object = st.secrets
     try:
+        value: object = st.secrets
         for key in keys:
             value = value[key]  # type: ignore[index]
         return value
-    except (KeyError, TypeError):
+    except Exception:
         return default
 
 
 def smtp_setting(name: str, default: object = None) -> object:
     """Obtiene SMTP desde Streamlit Secrets o variables seguras del servidor."""
+    environment_value = os.getenv(f"SMTP_{name.upper()}")
+    if environment_value is not None:
+        return environment_value
     secret = secret_value("smtp", name.lower(), default=None)
     if secret is not None:
         return secret
-    return os.getenv(f"SMTP_{name.upper()}", default)
+    return default
 
 
 def as_bool(value: object) -> bool:
