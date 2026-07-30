@@ -665,6 +665,12 @@ def parse_structured_tables(
             if current:
                 records.append(current)
                 previous_balance = current.get("Saldo")
+                current = None
+            # Los bancos suelen cerrar la tabla con renglones como
+            # "TOTAL RETIROS" o "TOTAL DEPÓSITOS". Aunque alguna cifra quede
+            # alineada con la columna de fecha, nunca representan movimientos.
+            if is_noise(description, config):
+                continue
             try:
                 date_text = date_match.group("date") if date_match else date_cell
                 date = normalize_date(date_text, default_year, default_month)
