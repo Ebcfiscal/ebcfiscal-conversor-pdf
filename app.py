@@ -10,6 +10,7 @@ Dependencias:
 from __future__ import annotations
 
 import io
+import os
 import re
 import smtplib
 import ssl
@@ -904,16 +905,31 @@ def secret_value(*keys: str, default: object = None) -> object:
         return default
 
 
+def smtp_setting(name: str, default: object = None) -> object:
+    """Obtiene SMTP desde Streamlit Secrets o variables seguras del servidor."""
+    secret = secret_value("smtp", name.lower(), default=None)
+    if secret is not None:
+        return secret
+    return os.getenv(f"SMTP_{name.upper()}", default)
+
+
+def as_bool(value: object) -> bool:
+    """Convierte valores booleanos de TOML o variables de entorno."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "si", "sí", "on"}
+
+
 def send_excel_email(recipient: str, excel_bytes: bytes, bank: str) -> None:
     """Envia el resultado por Gmail o cualquier servidor SMTP configurado."""
-    host = str(secret_value("smtp", "host", default="smtp.gmail.com"))
-    port = int(secret_value("smtp", "port", default=587))
-    username = str(secret_value("smtp", "username", default=""))
-    password = str(secret_value("smtp", "password", default=""))
-    sender = str(secret_value("smtp", "sender", default=username))
-    use_ssl = bool(secret_value("smtp", "use_ssl", default=False))
+    host = str(smtp_setting("host", "smtp.gmail.com"))
+    port = int(smtp_setting("port", 587))
+    username = str(smtp_setting("username", ""))
+    password = str(smtp_setting("password", ""))
+    sender = str(smtp_setting("sender", username))
+    use_ssl = as_bool(smtp_setting("use_ssl", False))
     if not username or not password or not sender:
-        raise RuntimeError("Faltan smtp.username, smtp.password o smtp.sender en .streamlit/secrets.toml")
+        raise RuntimeError("Faltan las credenciales seguras de SMTP")
 
     message = EmailMessage()
     message["Subject"] = f"Estado de cuenta {bank} convertido a Excel"
