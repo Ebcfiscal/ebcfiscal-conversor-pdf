@@ -251,6 +251,23 @@ def normalize_date(value: str, default_year: int, default_month: int | None = No
     return datetime(year, MONTHS[named.group(2)], int(named.group(1))).strftime("%d/%m/%Y")
 
 
+def normalize_day_month(value: str) -> str:
+    """Normaliza una fecha sin año a DD/MM, como la fecha LIQ de BBVA."""
+    text = comparable(value).upper().replace(".", "")
+    numeric = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})(?:[/-]\d{2,4})?", text)
+    if numeric:
+        day, month = int(numeric.group(1)), int(numeric.group(2))
+    else:
+        named_text = clean_text(re.sub(r"[/-]", " ", text))
+        named = re.fullmatch(r"(\d{1,2})\s+([A-Z]+)(?:\s+\d{2,4})?", named_text)
+        if not named or named.group(2) not in MONTHS:
+            raise ValueError(f"Fecha sin año no reconocida: {value}")
+        day, month = int(named.group(1)), MONTHS[named.group(2)]
+    # El año 2000 permite validar también 29/FEB sin incorporarlo al resultado.
+    datetime(2000, month, day)
+    return f"{day:02d}/{month:02d}"
+
+
 def group_words_by_line(words: Sequence[dict], tolerance: float = 3.0) -> list[list[dict]]:
     """Agrupa palabras por su coordenada vertical."""
     if not words:
@@ -787,8 +804,81 @@ def parse_bank(lines: Sequence[str], table_rows: Sequence[Sequence[str]], config
     return make_frame(records)
 
 
+def prepare_bbva_liquidation_rows(rows: Sequence[Sequence[str]]) -> list[list[str]]:
+    """Marca LIQ como la única columna de fecha en tablas BBVA con OPER y LIQ."""
+    prepared: list[list[str]] = []
+    for raw_row in rows:
+        row = [clean_text(cell) for cell in raw_row]
+        normalized = [comparable(cell) for cell in row]
+        liquidation_indexes = [
+            index
+            for index, cell in enumerate(normalized)
+            if cell in {"liq", "liquidacion", "fecha liq", "fecha liquidacion"}
+            or "fecha liq" in cell
+        ]
+        if liquidation_indexes:
+            liquidation_index = liquidation_indexes[-1]
+            for index, cell in enumerate(row):
+                if index != liquidation_index and header_role(cell) == "date":
+                    row[index] = "OPER_BANCO"
+            row[liquidation_index] = "FECHA LIQ"
+        prepared.append(row)
+    return prepared
+
+
+def bbva_liquidation_dates(lines: Sequence[str]) -> list[str]:
+    """Obtiene la segunda fecha de las líneas BBVA: OPER seguida de LIQ."""
+    dates: list[str] = []
+    for raw_line in lines:
+        line = clean_text(raw_line)
+        matches = list(DATE_ANY_RE.finditer(line))
+        if len(matches) < 2 or matches[0].start() > 8:
+            continue
+        # Exige un importe después de LIQ para excluir periodos y encabezados.
+        if not MONEY_RE.search(line[matches[1].end():]):
+            continue
+        try:
+            dates.append(normalize_day_month(matches[1].group("date")))
+        except (ValueError, OverflowError):
+            continue
+    return dates
+
+
+def apply_bbva_liquidation_dates(frame: pd.DataFrame, lines: Sequence[str]) -> pd.DataFrame:
+    """Reemplaza OPER por LIQ y conserva DD/MM sin inferir ningún año."""
+    if frame.empty:
+        return frame
+    result = frame.copy()
+    line_dates = bbva_liquidation_dates(lines)
+    use_line_sequence = len(line_dates) == len(result)
+
+    for index in range(len(result)):
+        description = clean_text(result.at[index, "Concepto / Descripción"])
+        leading_liquidation = DATE_RE.match(description)
+        chosen_date: str | None = line_dates[index] if use_line_sequence else None
+        if leading_liquidation:
+            try:
+                chosen_date = normalize_day_month(leading_liquidation.group("date"))
+                result.at[index, "Concepto / Descripción"] = clean_text(
+                    description[leading_liquidation.end():]
+                )
+            except (ValueError, OverflowError):
+                pass
+        if chosen_date is None:
+            # En tablas con columnas separadas, prepare_bbva_liquidation_rows ya
+            # hizo que la fecha existente provenga de LIQ; aquí sólo quitamos el año.
+            try:
+                chosen_date = normalize_day_month(str(result.at[index, "Fecha"]))
+            except (ValueError, OverflowError):
+                continue
+        result.at[index, "Fecha"] = chosen_date
+    return result
+
+
 def parse_bbva(lines: Sequence[str], table_rows: Sequence[Sequence[str]]) -> pd.DataFrame:
-    return parse_bank(lines, table_rows, CONFIGS["BBVA"])
+    prepared_rows = prepare_bbva_liquidation_rows(table_rows)
+    frame = parse_bank(lines, prepared_rows, CONFIGS["BBVA"])
+    return apply_bbva_liquidation_dates(frame, lines)
 
 
 def parse_banorte(lines: Sequence[str], table_rows: Sequence[Sequence[str]]) -> pd.DataFrame:
@@ -870,7 +960,17 @@ def dataframe_to_excel(frame: pd.DataFrame) -> bytes:
     """Genera un XLSX con filtros, encabezados, formatos y anchos adecuados."""
     output = io.BytesIO()
     export = frame.copy()
-    export["Fecha"] = pd.to_datetime(export["Fecha"], format="%d/%m/%Y", errors="coerce")
+
+    def excel_date(value: object) -> object:
+        text = clean_text(value)
+        if re.fullmatch(r"\d{2}/\d{2}", text):
+            return text
+        try:
+            return datetime.strptime(text, "%d/%m/%Y")
+        except ValueError:
+            return text
+
+    export["Fecha"] = export["Fecha"].map(excel_date)
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         export.to_excel(writer, sheet_name="Movimientos", index=False)
         sheet = writer.book["Movimientos"]
@@ -882,7 +982,7 @@ def dataframe_to_excel(frame: pd.DataFrame) -> bytes:
             cell.fill = header_fill
             cell.alignment = Alignment(horizontal="center")
         for cell in sheet["A"][1:]:
-            cell.number_format = "DD/MM/YYYY"
+            cell.number_format = "DD/MM/YYYY" if isinstance(cell.value, datetime) else "@"
         for col in ("C", "D", "E"):
             for cell in sheet[col][1:]:
                 cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
@@ -1270,7 +1370,7 @@ def render_app() -> None:
         use_container_width=True,
         num_rows="fixed",
         column_config={
-            "Fecha": st.column_config.TextColumn("Fecha", help="DD/MM/YYYY"),
+            "Fecha": st.column_config.TextColumn("Fecha", help="DD/MM para BBVA; DD/MM/YYYY para otros bancos"),
             "Concepto / Descripción": st.column_config.TextColumn("Concepto / Descripción", width="large"),
             "Depósito": st.column_config.NumberColumn("Depósito", format="$ %.2f", min_value=0.0),
             "Retiro": st.column_config.NumberColumn("Retiro", format="$ %.2f", min_value=0.0),
