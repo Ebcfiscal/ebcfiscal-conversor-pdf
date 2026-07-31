@@ -1428,19 +1428,6 @@ def render_app() -> None:
         except Exception as exc:
             st.warning(f"El Excel está listo, pero no se pudo enviar por email: {exc}")
 
-    with st.expander("Configuración del envío por email"):
-        st.code(
-            '[smtp]\n'
-            'host = "smtp.gmail.com"\n'
-            'port = 587\n'
-            'username = "tu_cuenta@gmail.com"\n'
-            'password = "tu_contraseña_de_aplicación"\n'
-            'sender = "tu_cuenta@gmail.com"\n'
-            'use_ssl = false',
-            language="toml",
-        )
-        st.caption("Guarda estos valores en .streamlit/secrets.toml. No subas ese archivo al repositorio.")
-
     st.markdown(
         '<div class="app-footer">Conversión terminada · Revisa siempre los datos antes de utilizarlos.</div>',
         unsafe_allow_html=True,
