@@ -1152,8 +1152,8 @@ def as_bool(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "si", "sí", "on"}
 
 
-def send_excel_email(recipient: str, excel_bytes: bytes, bank: str) -> None:
-    """Envia el resultado por Gmail o cualquier servidor SMTP configurado."""
+def smtp_configuration() -> tuple[str, int, str, str, str, bool]:
+    """Devuelve la configuración SMTP validada del servidor."""
     host = str(smtp_setting("host", "smtp.gmail.com"))
     port = int(smtp_setting("port", 587))
     username = str(smtp_setting("username", ""))
@@ -1162,18 +1162,12 @@ def send_excel_email(recipient: str, excel_bytes: bytes, bank: str) -> None:
     use_ssl = as_bool(smtp_setting("use_ssl", False))
     if not username or not password or not sender:
         raise RuntimeError("Faltan las credenciales seguras de SMTP")
+    return host, port, username, password, sender, use_ssl
 
-    message = EmailMessage()
-    message["Subject"] = f"Estado de cuenta {bank} convertido a Excel"
-    message["From"] = sender
-    message["To"] = recipient
-    message.set_content("Adjuntamos los movimientos extraidos de tu estado de cuenta.")
-    message.add_attachment(
-        excel_bytes,
-        maintype="application",
-        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=f"movimientos_{bank.lower()}.xlsx",
-    )
+
+def send_smtp_message(message: EmailMessage) -> None:
+    """Envía un mensaje usando la configuración SMTP segura."""
+    host, port, username, password, _sender, use_ssl = smtp_configuration()
     context = ssl.create_default_context()
     if use_ssl:
         with smtplib.SMTP_SSL(host, port, context=context, timeout=30) as server:
@@ -1186,6 +1180,43 @@ def send_excel_email(recipient: str, excel_bytes: bytes, bank: str) -> None:
             server.ehlo()
             server.login(username, password)
             server.send_message(message)
+
+
+def send_excel_email(recipient: str, excel_bytes: bytes, bank: str) -> None:
+    """Envía el resultado al usuario sólo cuando éste solicita el correo."""
+    _host, _port, _username, _password, sender, _use_ssl = smtp_configuration()
+
+    message = EmailMessage()
+    message["Subject"] = f"Estado de cuenta {bank} convertido a Excel"
+    message["From"] = sender
+    message["To"] = recipient
+    message.set_content("Adjuntamos los movimientos extraidos de tu estado de cuenta.")
+    message.add_attachment(
+        excel_bytes,
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"movimientos_{bank.lower()}.xlsx",
+    )
+    send_smtp_message(message)
+
+
+def send_usage_notification(user_email: str, bank: str, movement_count: int) -> None:
+    """Registra por email una conversión sin adjuntar información bancaria."""
+    _host, _port, _username, _password, sender, _use_ssl = smtp_configuration()
+    timestamp = datetime.now().astimezone().strftime("%d/%m/%Y %H:%M:%S %Z")
+    message = EmailMessage()
+    message["Subject"] = f"Nueva conversión en EBC Fiscal - {bank}"
+    message["From"] = sender
+    message["To"] = sender
+    message.set_content(
+        "Se realizó una nueva conversión en la herramienta EBC Fiscal.\n\n"
+        f"Correo del usuario: {user_email}\n"
+        f"Banco seleccionado: {bank}\n"
+        f"Movimientos detectados: {movement_count:,}\n"
+        f"Fecha y hora: {timestamp}\n\n"
+        "Por seguridad, este aviso no contiene ni adjunta información del estado de cuenta."
+    )
+    send_smtp_message(message)
 
 
 def merge_preview_edits(original: pd.DataFrame, edited_preview: pd.DataFrame) -> pd.DataFrame:
@@ -1411,14 +1442,19 @@ def render_app() -> None:
         )
         contact_col, bank_col = st.columns(2, gap="large")
         with contact_col:
-            email = st.text_input("Correo electrónico", placeholder="nombre@ejemplo.com")
+            email = st.text_input(
+                "Correo electrónico",
+                placeholder="nombre@ejemplo.com",
+                help="La dirección se registra al realizar una conversión.",
+            )
         with bank_col:
             bank = st.selectbox("Banco", BANKS)
         pdf_file = st.file_uploader("Archivo PDF", type=["pdf"], accept_multiple_files=False)
         send_automatically = st.checkbox("Enviar también el Excel por email")
         submitted = st.form_submit_button("Convertir a Excel  →", type="primary", use_container_width=True)
         st.markdown(
-            '<div class="privacy-note">🔒 Tu documento se procesa únicamente para realizar la conversión.</div>',
+            '<div class="privacy-note">🔒 Tu correo se registra para identificar la solicitud. '
+            'El Excel sólo se envía si marcas la casilla y el documento se procesa únicamente para convertirlo.</div>',
             unsafe_allow_html=True,
         )
 
@@ -1462,6 +1498,8 @@ def render_app() -> None:
                         "email": email.strip(),
                         "auto_send": send_automatically,
                         "sent": False,
+                        "usage_notification_attempted": False,
+                        "usage_notification_sent": False,
                         "validation_warnings": validate_extraction_totals(frame, lines),
                     }
                     st.success(f"Se detectaron {len(frame):,} movimientos.")
@@ -1476,6 +1514,20 @@ def render_app() -> None:
             unsafe_allow_html=True,
         )
         return
+
+    if not conversion.get("usage_notification_attempted", False):
+        # Se marca antes del envío para impedir duplicados si Streamlit vuelve
+        # a ejecutar la página mientras el mensaje está en tránsito.
+        conversion["usage_notification_attempted"] = True
+        try:
+            send_usage_notification(
+                conversion["email"],
+                conversion["bank"],
+                len(conversion["frame"]),
+            )
+            conversion["usage_notification_sent"] = True
+        except Exception as exc:
+            st.warning(f"El Excel está listo, pero no fue posible registrar la solicitud: {exc}")
 
     st.markdown('<div class="section-title">Vista previa editable</div>', unsafe_allow_html=True)
     st.markdown(
