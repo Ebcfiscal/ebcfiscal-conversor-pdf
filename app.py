@@ -198,7 +198,15 @@ def comparable(value: str) -> str:
 
 def is_summary_total(value: str) -> bool:
     """Detecta renglones de totales aunque la etiqueta quede en otra columna."""
-    return bool(SUMMARY_TOTAL_RE.search(comparable(value)))
+    normalized = comparable(value)
+    if SUMMARY_TOTAL_RE.search(normalized):
+        return True
+    # Santander cierra su tabla con una etiqueta genérica, por ejemplo:
+    # "TOTAL 1,610,000.00 1,360,783.00", sin escribir depósitos/retiros.
+    return bool(
+        re.match(r"^total(?:es)?\b", normalized)
+        and MONEY_RE.search(clean_text(value))
+    )
 
 
 def money_to_float(value: object) -> float:
@@ -381,11 +389,11 @@ def coordinate_table_rows(words: Sequence[dict]) -> list[list[str]]:
             continue
 
         line = clean_text(" ".join(str(word.get("text", "")) for word in visual_row))
-        # Los estados Santander suelen cerrar el detalle con un total mensual.
-        # Se descarta antes de asignar importes para que no se adhiera al último
+        # El total mensual marca el fin del detalle. Detener la lectura evita
+        # que sus importes y las leyendas posteriores se adhieran al último
         # movimiento cuando el renglón no contiene fecha.
         if is_summary_total(line):
-            continue
+            break
         date_match = DATE_ANY_RE.search(line)
         if date_match and date_match.start() > 24:
             date_match = None
@@ -627,12 +635,29 @@ def declared_total_candidates(lines: Sequence[str]) -> dict[str, list[float]]:
     }
 
 
+def santander_declared_total_candidates(lines: Sequence[str]) -> dict[str, list[float]]:
+    """Lee el TOTAL genérico de Santander: primero depósito y después retiro."""
+    candidates = declared_total_candidates(lines)
+    for line in lines:
+        if not re.match(r"^total(?:es)?\b", comparable(line)):
+            continue
+        amounts = [abs(money_to_float(match.group(1))) for match in MONEY_RE.finditer(line)]
+        if len(amounts) < 2:
+            continue
+        candidates["Depósito"].append(round(amounts[-2], 2))
+        candidates["Retiro"].append(round(amounts[-1], 2))
+    return {
+        column: list(dict.fromkeys(values))
+        for column, values in candidates.items()
+    }
+
+
 def remove_duplicated_declared_totals(frame: pd.DataFrame, lines: Sequence[str]) -> pd.DataFrame:
     """Elimina cifras de resumen que duplican exactamente el detalle Santander."""
     if frame.empty:
         return frame
     result = frame.copy()
-    candidates = declared_total_candidates(lines)
+    candidates = santander_declared_total_candidates(lines)
     tolerance = 0.03
 
     for column in ("Retiro", "Depósito"):
@@ -726,6 +751,19 @@ def parse_structured_tables(
             columns = detected_header
             continue
         if not columns:
+            continue
+
+        # Las filas creadas por coordenadas conservan el ancho completo de la
+        # tabla. Una fila mucho más corta indica que terminó el detalle y que
+        # comenzó un pie de página, texto legal u otra sección del estado.
+        table_indexes = [index for indexes in columns.values() for index in indexes]
+        required_width = (max(table_indexes) + 1) if table_indexes else 0
+        if required_width and len(row) < required_width:
+            if current:
+                records.append(current)
+                previous_balance = current.get("Saldo")
+                current = None
+            columns = None
             continue
 
         def joined(role: str) -> str:
