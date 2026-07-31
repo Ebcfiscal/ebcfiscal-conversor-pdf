@@ -75,8 +75,19 @@ class BankConfig:
 
 COMMON_IGNORE = (
     "saldo anterior", "saldo inicial", "total depositos", "total depósitos",
-    "total retiros", "resumen", "pagina ", "página ", "fecha concepto",
+    "total retiros", "total cargos", "total abonos", "retiros totales",
+    "cargos totales", "depositos totales", "depósitos totales", "abonos totales",
+    "resumen", "pagina ", "página ", "fecha concepto",
     "fecha descripcion", "fecha descripción", "estado de cuenta", "periodo",
+)
+
+SUMMARY_TOTAL_RE = re.compile(
+    r"\b(?:total(?:es)?|suma(?:s)?|acumulado(?:s)?)"
+    r"(?:\s+(?:de|del|los|las|en|el|periodo|mes))*\s+"
+    r"(?:retiros?|cargos?|depositos?|abonos?|movimientos?)\b|"
+    r"\b(?:retiros?|cargos?|depositos?|abonos?|movimientos?)\s+"
+    r"(?:totales?|acumulados?)\b",
+    re.I,
 )
 
 CONFIGS = {
@@ -183,6 +194,11 @@ def clean_text(value: object) -> str:
 def comparable(value: str) -> str:
     value = unicodedata.normalize("NFKD", clean_text(value)).encode("ascii", "ignore").decode()
     return value.casefold()
+
+
+def is_summary_total(value: str) -> bool:
+    """Detecta renglones de totales aunque la etiqueta quede en otra columna."""
+    return bool(SUMMARY_TOTAL_RE.search(comparable(value)))
 
 
 def money_to_float(value: object) -> float:
@@ -365,6 +381,11 @@ def coordinate_table_rows(words: Sequence[dict]) -> list[list[str]]:
             continue
 
         line = clean_text(" ".join(str(word.get("text", "")) for word in visual_row))
+        # Los estados Santander suelen cerrar el detalle con un total mensual.
+        # Se descarta antes de asignar importes para que no se adhiera al último
+        # movimiento cuando el renglón no contiene fecha.
+        if is_summary_total(line):
+            continue
         date_match = DATE_ANY_RE.search(line)
         if date_match and date_match.start() > 24:
             date_match = None
@@ -499,6 +520,8 @@ def extract_pdf_rows(pdf_bytes: bytes) -> tuple[list[str], list[list[str]]]:
 
 def is_noise(line: str, config: BankConfig) -> bool:
     normalized = comparable(line)
+    if is_summary_total(normalized):
+        return True
     if any(token in normalized for token in map(comparable, config.ignore)):
         return True
     header_hits = sum(comparable(header) in normalized for header in config.headers)
@@ -574,8 +597,19 @@ def make_frame(records: Sequence[dict]) -> pd.DataFrame:
 
 def extract_declared_totals(lines: Sequence[str]) -> dict[str, float]:
     """Lee totales del resumen sin confundir encabezados o movimientos."""
-    deposits: list[float] = []
-    withdrawals: list[float] = []
+    candidates = declared_total_candidates(lines)
+    totals: dict[str, float] = {}
+    for column, values in candidates.items():
+        if values:
+            # El total mensual es normalmente el mayor de los subtotales; las
+            # leyendas repetidas en el PDF cuentan una sola vez.
+            totals[column] = round(max(values), 2)
+    return totals
+
+
+def declared_total_candidates(lines: Sequence[str]) -> dict[str, list[float]]:
+    """Obtiene importes únicos impresos como totales de depósitos o retiros."""
+    candidates: dict[str, list[float]] = {"Depósito": [], "Retiro": []}
     for line in lines:
         normalized = comparable(line)
         if "deposito" in normalized and "retiro" in normalized:
@@ -583,16 +617,45 @@ def extract_declared_totals(lines: Sequence[str]) -> dict[str, float]:
         amounts = [abs(money_to_float(match.group(1))) for match in MONEY_RE.finditer(line)]
         if not amounts:
             continue
-        if re.search(r"\b(?:total\s+de\s+|total\s+)?depositos\b", normalized):
-            deposits.append(amounts[-1])
-        elif re.search(r"\b(?:total\s+de\s+|total\s+)?retiros\b", normalized):
-            withdrawals.append(amounts[-1])
-    totals: dict[str, float] = {}
-    if deposits:
-        totals["Depósito"] = round(sum(deposits), 2)
-    if withdrawals:
-        totals["Retiro"] = round(sum(withdrawals), 2)
-    return totals
+        if re.search(r"\b(?:depositos?|abonos?)\b", normalized) and is_summary_total(normalized):
+            candidates["Depósito"].append(round(amounts[-1], 2))
+        elif re.search(r"\b(?:retiros?|cargos?)\b", normalized) and is_summary_total(normalized):
+            candidates["Retiro"].append(round(amounts[-1], 2))
+    return {
+        column: list(dict.fromkeys(values))
+        for column, values in candidates.items()
+    }
+
+
+def remove_duplicated_declared_totals(frame: pd.DataFrame, lines: Sequence[str]) -> pd.DataFrame:
+    """Elimina cifras de resumen que duplican exactamente el detalle Santander."""
+    if frame.empty:
+        return frame
+    result = frame.copy()
+    candidates = declared_total_candidates(lines)
+    tolerance = 0.03
+
+    for column in ("Retiro", "Depósito"):
+        values = pd.to_numeric(result[column], errors="coerce").fillna(0.0)
+        column_total = round(float(values.sum()), 2)
+        for declared in candidates[column]:
+            # Una fila es un resumen duplicado sólo cuando contiene ella sola
+            # el total declarado y todas las demás filas ya suman ese total.
+            duplicate_indexes = [
+                index for index, amount in values.items()
+                if abs(float(amount) - declared) <= tolerance
+                and abs((column_total - float(amount)) - declared) <= tolerance
+            ]
+            if not duplicate_indexes:
+                continue
+            duplicate_index = duplicate_indexes[-1]
+            result.at[duplicate_index, column] = 0.0
+            values.at[duplicate_index] = 0.0
+            column_total = round(float(values.sum()), 2)
+            break
+
+    has_movement = result["Depósito"].gt(0) | result["Retiro"].gt(0)
+    return result[has_movement].reset_index(drop=True)
 
 
 def validate_extraction_totals(frame: pd.DataFrame, lines: Sequence[str]) -> list[str]:
@@ -913,7 +976,8 @@ def parse_banorte(lines: Sequence[str], table_rows: Sequence[Sequence[str]]) -> 
 
 
 def parse_santander(lines: Sequence[str], table_rows: Sequence[Sequence[str]]) -> pd.DataFrame:
-    return parse_bank(lines, table_rows, CONFIGS["Santander"])
+    frame = parse_bank(lines, table_rows, CONFIGS["Santander"])
+    return remove_duplicated_declared_totals(frame, lines)
 
 
 def parse_citibanamex(lines: Sequence[str], table_rows: Sequence[Sequence[str]]) -> pd.DataFrame:
